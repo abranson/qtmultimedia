@@ -141,6 +141,9 @@ QGstreamerPlayerSession::QGstreamerPlayerSession(QObject *parent)
      m_everPlayed(false),
      m_isLiveSource(false),
      m_isPlaylist(false)
+#if GST_CHECK_VERSION(1,10,0)
+    , m_streamCollection(0)
+#endif
 {
     gboolean result = gst_type_find_register(0, "playlist", GST_RANK_MARGINAL, playlistTypeFindFunction, 0, 0, this, 0);
     Q_ASSERT(result == TRUE);
@@ -271,6 +274,10 @@ QGstreamerPlayerSession::~QGstreamerPlayerSession()
         gst_object_unref(GST_OBJECT(m_nullVideoSink));
         gst_object_unref(GST_OBJECT(m_videoOutputBin));
     }
+
+#if GST_CHECK_VERSION(1,10,0)
+    clearStreamCollection();
+#endif
 }
 
 GstElement *QGstreamerPlayerSession::playbin() const
@@ -307,6 +314,9 @@ void QGstreamerPlayerSession::loadFromStream(const QNetworkRequest &request, QIO
     m_duration = -1;
     m_lastPosition = 0;
     m_isPlaylist = false;
+#if GST_CHECK_VERSION(1,10,0)
+    resetStreamsApiState();
+#endif
 
     if (!m_appSrc)
         m_appSrc = new QGstAppSrc(this);
@@ -337,6 +347,9 @@ void QGstreamerPlayerSession::loadFromUri(const QNetworkRequest &request)
     m_duration = -1;
     m_lastPosition = 0;
     m_isPlaylist = false;
+#if GST_CHECK_VERSION(1,10,0)
+    resetStreamsApiState();
+#endif
 
 #if defined(HAVE_GST_APPSRC)
     if (m_appSrc) {
@@ -451,11 +464,20 @@ int QGstreamerPlayerSession::activeStream(QMediaStreamsControl::StreamType strea
         default:
             break;
         }
+
+        if (streamNumber >= 0) {
+#if GST_CHECK_VERSION(1,10,0)
+            if (m_streamCollection) {
+                const QString streamId = m_streamIds.value(streamNumber);
+                const QList<QString> streams = m_streamsByType.value(streamType);
+                streamNumber = streams.indexOf(streamId);
+            } else
+#endif
+            {
+                streamNumber += m_playbin2StreamOffset.value(streamType,0);
+            }
+        }
     }
-
-    if (streamNumber >= 0)
-        streamNumber += m_playbin2StreamOffset.value(streamType,0);
-
     return streamNumber;
 }
 
@@ -465,8 +487,18 @@ void QGstreamerPlayerSession::setActiveStream(QMediaStreamsControl::StreamType s
     qDebug() << Q_FUNC_INFO << streamType << streamNumber;
 #endif
 
-    if (streamNumber >= 0)
-        streamNumber -= m_playbin2StreamOffset.value(streamType,0);
+    if (streamNumber >= 0) {
+#if GST_CHECK_VERSION(1,10,0)
+        if (m_streamCollection) {
+            const QString streamId = m_streamIds.value(streamNumber);
+            const QList<QString> streams = m_streamsByType.value(streamType);
+            streamNumber = streams.indexOf(streamId);
+        } else
+#endif
+        {
+            streamNumber -= m_playbin2StreamOffset.value(streamType,0);
+        }
+    }
 
     if (m_playbin) {
         switch (streamType) {
@@ -1191,6 +1223,34 @@ bool QGstreamerPlayerSession::processBusMessage(const QGstreamerMessage &message
             case GST_MESSAGE_STREAM_STATUS:
             case GST_MESSAGE_UNKNOWN:
                 break;
+#if GST_CHECK_VERSION(1,10,0)
+            case GST_MESSAGE_STREAM_COLLECTION:
+            {
+                GstStreamCollection *collection = 0;
+                gst_message_parse_stream_collection(gm, &collection);
+                if (collection) {
+                    updateStreamsFromCollection(collection);
+                    gst_object_unref(collection);
+                }
+                break;
+            }
+            case GST_MESSAGE_STREAMS_SELECTED:
+            {
+                GstStreamCollection *collection = 0;
+                gst_message_parse_streams_selected(gm, &collection);
+
+                if (collection) {
+                #ifdef DEBUG_PLAYBIN
+                    qDebug() << Q_FUNC_INFO << "streams-selected for collection" << gst_stream_collection_get_size(collection);
+                #endif
+                    updateStreamsFromCollection(collection);
+                    gst_object_unref(collection);
+                } else if (m_streamCollection) {
+                    getStreamsInfo();
+                }
+                break;
+            }
+#endif
             case GST_MESSAGE_ERROR: {
                     GError *err;
                     gchar *debug;
@@ -1358,6 +1418,58 @@ bool QGstreamerPlayerSession::processBusMessage(const QGstreamerMessage &message
     return false;
 }
 
+#if GST_CHECK_VERSION(1,10,0)
+void QGstreamerPlayerSession::clearStreamCollection()
+{
+    if (m_streamCollection) {
+        gst_object_unref(m_streamCollection);
+        m_streamCollection = 0;
+    }
+}
+
+void QGstreamerPlayerSession::resetStreamsApiState()
+{
+    clearStreamCollection();
+    m_streamIds.clear();
+    m_streamsByType.clear();
+}
+
+QMediaStreamsControl::StreamType QGstreamerPlayerSession::streamTypeFromStream(GstStream *stream) const
+{
+    if (!stream)
+        return QMediaStreamsControl::UnknownStream;
+
+    switch (gst_stream_get_stream_type(stream)) {
+    case GST_STREAM_TYPE_AUDIO:
+        return QMediaStreamsControl::AudioStream;
+    case GST_STREAM_TYPE_VIDEO:
+        return QMediaStreamsControl::VideoStream;
+    case GST_STREAM_TYPE_TEXT:
+        return QMediaStreamsControl::SubPictureStream;
+    default:
+        break;
+    }
+
+    return QMediaStreamsControl::UnknownStream;
+}
+
+void QGstreamerPlayerSession::updateStreamsFromCollection(GstStreamCollection *collection)
+{
+    if (!collection)
+        return;
+
+    clearStreamCollection();
+    m_streamCollection = GST_STREAM_COLLECTION(gst_object_ref(collection));
+
+#ifdef DEBUG_PLAYBIN
+    qDebug() << Q_FUNC_INFO << "received" << gst_stream_collection_get_size(collection) << "streams";
+#endif
+
+    getStreamsInfo();
+}
+
+#endif
+
 void QGstreamerPlayerSession::getStreamsInfo()
 {
     QList< QMap<QString,QVariant> > oldProperties = m_streamProperties;
@@ -1367,6 +1479,8 @@ void QGstreamerPlayerSession::getStreamsInfo()
     //check if video is available:
     bool haveAudio = false;
     bool haveVideo = false;
+    m_streamIds.clear();
+    m_streamsByType.clear();
     m_streamProperties.clear();
     m_streamTypes.clear();
     m_playbin2StreamOffset.clear();
@@ -1374,17 +1488,64 @@ void QGstreamerPlayerSession::getStreamsInfo()
     gint audioStreamsCount = 0;
     gint videoStreamsCount = 0;
     gint textStreamsCount = 0;
+    
+#if GST_CHECK_VERSION(1,10,0)
 
+    if (!m_streamCollection) {
+        GstStreamCollection *collection = 0;
+               if (g_object_class_find_property(G_OBJECT_GET_CLASS(m_playbin), "stream-collection"))
+                   g_object_get(G_OBJECT(m_playbin), "stream-collection", &collection, NULL);
+
+               if (collection)
+                   m_streamCollection = collection;
+    }
+
+    const guint streamCount = gst_stream_collection_get_size(m_streamCollection);
+    for (guint i = 0; i < streamCount; ++i) {
+        GstStream *stream = gst_stream_collection_get_stream(m_streamCollection, i);
+        QMediaStreamsControl::StreamType streamType = streamTypeFromStream(stream);
+        if (streamType == QMediaStreamsControl::UnknownStream)
+            continue;
+
+        const gchar *streamIdC = gst_stream_get_stream_id(stream);
+        QString streamId = QString::fromUtf8(streamIdC ? streamIdC : "");
+        m_streamIds.append(streamId);
+        m_streamTypes.append(streamType);
+        m_streamsByType[streamType].append(streamId);
+
+        QMap<QString, QVariant> streamProps;
+        const GstTagList *tags = gst_stream_get_tags(stream);
+        if (tags) {
+            gchar *languageCode = 0;
+            if (gst_tag_list_get_string(tags, GST_TAG_LANGUAGE_CODE, &languageCode))
+                streamProps[QMediaMetaData::Language] = QString::fromUtf8(languageCode);
+            g_free(languageCode);
+        }
+
+        m_streamProperties.append(streamProps);
+
+        haveAudio |= streamType == QMediaStreamsControl::AudioStream;
+        haveVideo |= streamType == QMediaStreamsControl::VideoStream;
+
+#ifdef DEBUG_PLAYBIN
+            qDebug() << "stream" << streamId << "type" << streamType;
+#endif
+    }
+
+    audioStreamsCount = m_streamsByType.value(QMediaStreamsControl::AudioStream).count();
+    videoStreamsCount = m_streamsByType.value(QMediaStreamsControl::VideoStream).count();
+    textStreamsCount = m_streamsByType.value(QMediaStreamsControl::SubPictureStream).count();
+#else
     g_object_get(G_OBJECT(m_playbin), "n-audio", &audioStreamsCount, NULL);
     g_object_get(G_OBJECT(m_playbin), "n-video", &videoStreamsCount, NULL);
     g_object_get(G_OBJECT(m_playbin), "n-text", &textStreamsCount, NULL);
-
+    
     haveAudio = audioStreamsCount > 0;
     haveVideo = videoStreamsCount > 0;
-
+#endif
     m_playbin2StreamOffset[QMediaStreamsControl::AudioStream] = 0;
     m_playbin2StreamOffset[QMediaStreamsControl::VideoStream] = audioStreamsCount;
-    m_playbin2StreamOffset[QMediaStreamsControl::SubPictureStream] = audioStreamsCount+videoStreamsCount;
+    m_playbin2StreamOffset[QMediaStreamsControl::SubPictureStream] = audioStreamsCount + videoStreamsCount;
 
     for (int i=0; i<audioStreamsCount; i++)
         m_streamTypes.append(QMediaStreamsControl::AudioStream);
@@ -1423,7 +1584,7 @@ void QGstreamerPlayerSession::getStreamsInfo()
             gchar *languageCode = 0;
             if (gst_tag_list_get_string(tags, GST_TAG_LANGUAGE_CODE, &languageCode))
                 streamProperties[QMediaMetaData::Language] = QString::fromUtf8(languageCode);
-
+    
             //qDebug() << "language for setream" << i << QString::fromUtf8(languageCode);
             g_free (languageCode);
             gst_tag_list_free(tags);

@@ -179,6 +179,13 @@ private:
 
     void processInvalidMedia(QMediaPlayer::Error errorCode, const QString& errorString);
 
+#if GST_CHECK_VERSION(1,10,0)
+    void clearStreamCollection();
+    void updateStreamsFromCollection(GstStreamCollection *collection);
+    QMediaStreamsControl::StreamType streamTypeFromStream(GstStream *stream) const;
+    void resetStreamsApiState();
+#endif
+
     void removeVideoBufferProbe();
     void addVideoBufferProbe();
     void removeAudioBufferProbe();
@@ -220,6 +227,11 @@ private:
     QList< QMap<QString,QVariant> > m_streamProperties;
     QList<QMediaStreamsControl::StreamType> m_streamTypes;
     QMap<QMediaStreamsControl::StreamType, int> m_playbin2StreamOffset;
+#if GST_CHECK_VERSION(1,10,0)
+    GstStreamCollection *m_streamCollection;
+#endif
+    QList<QString> m_streamIds;
+    QMap<QMediaStreamsControl::StreamType, QList<QString> > m_streamsByType;
 
     QGstreamerVideoProbeControl *m_videoProbe;
     QGstreamerAudioProbeControl *m_audioProbe;
@@ -236,7 +248,6 @@ private:
     int m_durationQueries;
 
     bool m_displayPrerolledFrame;
-
     enum SourceType
     {
         UnknownSrc,
